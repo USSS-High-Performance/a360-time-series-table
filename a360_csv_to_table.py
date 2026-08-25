@@ -1,5 +1,6 @@
 import os
 import requests
+import time
 
 # Authenticate
 auth = (os.getenv("SB_USERNAME"), os.getenv("SB_PASSWORD"))
@@ -14,11 +15,14 @@ timeseries_dicts = [ # list of dictionaries
     }
 ]
 
-# Search Time period for new data in the form name
+# start_time = 24 hours ago
+# end_time = right now
 
-# Extract Form Name and event-id 
+# For each entry in timeseries dict, search Time period for new data in the form name
 
-# For each event, If Target Fields are empty, then...
-# break up txt in source_field into rows and columns, and push to target_fields, they fields are index aligned to the source_csv_columns
+## Extract Form Name and event-id 
 
-# push back up against the event_id
+### For each event, If Target Fields are empty, then...
+### break up txt in source_field into rows and columns, and push to target_fields, they fields are index aligned to the source_csv_columns
+
+### push back up against the event_id

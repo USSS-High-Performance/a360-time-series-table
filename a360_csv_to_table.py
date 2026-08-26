@@ -9,8 +9,9 @@ Flow
 1. Authenticate with HTTP Basic Auth (v1 API).
 2. Sync users (/api/v1/usersynchronise) to get the list of user IDs the account
    can see.
-3. Sync events (/api/v1/synchronise) for each configured form, limited to events
-   changed in the last LOOKBACK_HOURS.
+3. Search events (/api/v1/eventsearch) for each configured form, limited to
+   events DATED within the last LOOKBACK_HOURS. (We use eventsearch, not
+   synchronise: synchronise filters by last-modified time, not event date.)
 4. For every event whose target table fields are still empty, parse the CSV text
    in the source field into rows/columns and APPEND them to the event's existing
    rows (keeping all the original data intact).
@@ -120,35 +121,48 @@ def sync_users(last_sync_time=0, cached_user_ids=None):
 
 
 # --------------------------------------------------------------------------- #
-# Step 2: Sync events  (POST /api/v1/synchronise)
+# Step 2: Search events by date  (POST /api/v1/eventsearch)
+#
+# NOTE: We deliberately use /eventsearch, not /synchronise.
+#   * /synchronise filters by lastSynchronisationTimeOnServer, which is a
+#     *last-modified* cursor for incremental caching -- it does NOT filter by
+#     the event's own date. Passing "now - 24h" there returns only events
+#     edited in the last 24h, so events dated today but entered earlier are
+#     missed (this is why a date-window query returned 0 events).
+#   * /eventsearch does real server-side date filtering via startDate /
+#     finishDate in dd/mm/yyyy, which is what we want here.
 # --------------------------------------------------------------------------- #
-def sync_events(form_name, user_ids, last_sync_time=0):
-    """Return all events for a form (for the given users) since last_sync_time.
+def search_events(form_name, user_ids, start_date, finish_date):
+    """Return events for a form whose date falls within [start_date, finish_date].
 
-    Follows cursor pagination. Returns a list of event dicts.
+    Dates are dd/mm/yyyy strings. Follows cursor pagination. Returns event dicts.
     """
     events = []
-    cursor = None
+    cursor = None  # omit on first page
 
     while True:
         payload = {
-            "formName": form_name,
-            "lastSynchronisationTimeOnServer": last_sync_time,
+            "formNames": [form_name],   # eventsearch takes a LIST of form names
+            "startDate": start_date,    # dd/mm/yyyy, inclusive lower bound
+            "finishDate": finish_date,  # dd/mm/yyyy, inclusive upper bound
             "userIds": user_ids,
-            "paginate": True,
-            "cursor": cursor,
+            "paginate": True,           # top-level pagination for eventsearch
         }
+        if cursor:
+            payload["cursor"] = cursor
+
         resp = requests.post(
-            f"{BASE_URL}/synchronise?informat=json&format=json",
+            f"{BASE_URL}/eventsearch?informat=json&format=json",
             headers=HEADERS,
             json=payload,
         )
         resp.raise_for_status()
         data = resp.json()
 
-        events.extend(data.get("export", {}).get("events", []))
+        events.extend(data.get("events", []))
 
-        cursor = data.get("cursor")
+        # Docs prose says next_cursor; OpenAPI schema says cursor. Accept either.
+        cursor = data.get("next_cursor") or data.get("cursor")
         if not cursor:
             break
 
@@ -267,15 +281,17 @@ def import_event(payload):
 # Main
 # --------------------------------------------------------------------------- #
 def main():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now()
     window_start = now - datetime.timedelta(hours=LOOKBACK_HOURS)
-    # AMS lastSynchronisationTimeOnServer is an epoch-millis server timestamp;
-    # passing the window start returns events changed since then ("last 24h").
-    last_sync_ms = int(window_start.timestamp() * 1000)
+    # /eventsearch filters by the event's own date (dd/mm/yyyy). Date granularity
+    # means we widen to whole days so nothing in the window is missed; if the
+    # lookback crosses midnight this naturally spans yesterday..today.
+    start_date = window_start.strftime("%d/%m/%Y")
+    finish_date = now.strftime("%d/%m/%Y")
 
     print(f"Mode: {'DRY RUN (no writes)' if DRY_RUN else 'LIVE (will push back)'}")
-    print(f"Looking for events changed since {window_start.isoformat()} "
-          f"(lastSynchronisationTimeOnServer={last_sync_ms})")
+    print(f"Searching events dated {start_date} .. {finish_date} "
+          f"(last {LOOKBACK_HOURS}h)")
 
     # Step 1: users
     user_cache, _ = sync_users()
@@ -291,8 +307,8 @@ def main():
         source_columns = spec["source_csv_columns"]
         target_fields = spec["target_fields"]
 
-        # Step 2: events for this form in the window
-        events = sync_events(form_name, user_ids, last_sync_time=last_sync_ms)
+        # Step 2: events for this form in the date window
+        events = search_events(form_name, user_ids, start_date, finish_date)
         dump[form_name] = events
         print(f"\nForm '{form_name}': {len(events)} event(s) in window")
 

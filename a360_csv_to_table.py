@@ -25,8 +25,8 @@ Set SB_DRY_RUN=false once you've confirmed the JSON looks right.
 """
 
 import os
-from loading import load_dotenv
-load_dotenv()  # load .env file if present
+from dotenv import load_dotenv
+load_dotenv()
 import csv
 import io
 import json

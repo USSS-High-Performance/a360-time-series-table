@@ -57,6 +57,12 @@ dry_run <- tolower(Sys.getenv("SB_DRY_RUN", "true")) %in% c("true", "1", "yes")
 # RStudio session if you want the confirmation prompt.
 interactive_mode <- tolower(Sys.getenv("SB_INTERACTIVE", "false")) %in% c("true", "1", "yes")
 
+# Downsample the parsed time series to cut volume: keep every Nth sample.
+# SB_SAMPLE_EVERY=2 (default) keeps every other row (rows 1,3,5,...); =1 keeps
+# all; =3 keeps every third; etc.
+sample_every <- suppressWarnings(as.integer(Sys.getenv("SB_SAMPLE_EVERY", "2")))
+if (is.na(sample_every) || sample_every < 1) sample_every <- 1L
+
 ## Source form / target form / field mapping.
 ##
 ##   source_field  : long CSV-string field on the source form to parse
@@ -232,6 +238,11 @@ for (spec in timeseries_specs) {
     next
   }
 
+  # Show the exact column names sb_get_event() returned. Use these to confirm
+  # how carry fields are actually spelled (smartabaseR may not name them "ID" /
+  # "Detailed Sport Info" verbatim -- adjust carry_fields above to match).
+  log_status("  source columns: ", paste(names(events), collapse = " | "))
+
   missing_carry <- setdiff(carry_fields, names(events))
   if (length(missing_carry) > 0) {
     log_status("  WARNING: carry field(s) not found on source form (will be blank): ",
@@ -271,10 +282,17 @@ for (spec in timeseries_specs) {
       next
     }
 
+    # Downsample: keep every Nth sample (SB_SAMPLE_EVERY) to reduce volume.
+    raw_n <- nrow(samples)
+    if (sample_every > 1) {
+      samples <- samples[seq(1, raw_n, by = sample_every), , drop = FALSE]
+    }
+
     inserts[[as.character(eid)]] <-
       build_event_insert(event_rows, samples, target_fields, carry_fields)
     log_status("  event ", eid, " (", event_rows$start_date[[1]], "): ",
-               nrow(samples), " sample row(s) -> target insert")
+               raw_n, " sample(s) -> ", nrow(samples),
+               " row(s) after keeping every ", sample_every, " -> target insert")
   }
 
   if (length(inserts) == 0) {
@@ -311,20 +329,44 @@ for (spec in timeseries_specs) {
     next
   }
 
+  # Insert ONE event per call. A single sb_insert_event() over many events'
+  # rows can't tell where one event ends and the next begins (that caused the
+  # UNEXPECTED_ERROR on the bound frame), so we loop and push each event's frame
+  # on its own. Per-event tryCatch keeps one failure from aborting the rest.
+  #
   # table_field lists ONLY the fields that vary per row (Timestamp, Heart Rate).
   # ID / Detailed Sport Info are non-table and stay on row 1. user_id ties each
   # new event to the source athlete; start_date keeps it on the session's date.
-  sb_insert_event(
-    df = insert_df,
-    form = target_form,
-    url = sb_url,
-    username = sb_username,
-    password = sb_password,
-    option = sb_insert_event_option(
-      table_field = target_fields,
-      interactive_mode = interactive_mode
-    )
-  )
+  n_ok <- 0L
+  n_fail <- 0L
+  for (eid in names(inserts)) {
+    one_df <- inserts[[eid]]
+    ok <- tryCatch({
+      sb_insert_event(
+        df = one_df,
+        form = target_form,
+        url = sb_url,
+        username = sb_username,
+        password = sb_password,
+        option = sb_insert_event_option(
+          table_field = target_fields,
+          interactive_mode = interactive_mode
+        )
+      )
+      TRUE
+    }, error = function(e) {
+      log_status("  event ", eid, ": INSERT FAILED -- ", conditionMessage(e))
+      FALSE
+    })
+    if (isTRUE(ok)) {
+      n_ok <- n_ok + 1L
+      log_status("  event ", eid, ": inserted (", nrow(one_df), " rows)")
+    } else {
+      n_fail <- n_fail + 1L
+    }
+  }
+  log_status("  insert summary for '", target_form, "': ",
+             n_ok, " succeeded, ", n_fail, " failed")
 }
 
 log_status("\nDone.")

@@ -13,7 +13,7 @@
 ##
 ## Why sb_update_event(): "updating" in Smartabase overwrites the whole event, so
 ## we build each event from its FULL sb_get_event() output (every existing field
-## + event_id) and simply append the new table rows. Nothing else is lost.
+## + event_id) and expand it into one table row per sample. Nothing else is lost.
 ##
 ## Credentials are read from environment variables -- never hardcode them here:
 ##   SB_URL       e.g. usopc.smartabase.com/athlete360-usss   (has a default)
@@ -75,59 +75,46 @@ log_status <- function(...) {
   flush.console()
 }
 
-## Split the CSV string held in a source field into a tibble whose columns are
-## named after target_fields (index-aligned to source_columns).
+## Split the time-series string held in a source field into a tibble whose
+## columns are named after target_fields (index-aligned to source_columns).
+##
+## AMS stores this field as one long string. Samples are NOT newline-separated:
+## they are delimited by HTML break tags -- literally "< br/>" in the data (also
+## handle <br>, <br/>, <br /> and real newlines just in case). Each sample is
+## comma-separated, e.g. "07:41:18,105". There is usually no header row.
 parse_samples <- function(text, source_columns, target_fields) {
-  text <- trimws(as.character(text %||% ""))
-  if (identical(text, "") || is.na(text)) {
+  text <- as.character(text %||% "")
+  if (!nzchar(trimws(text))) {
     return(NULL)
   }
 
-  con <- textConnection(text)
-  on.exit(close(con), add = TRUE)
-  df <- tryCatch(
-    utils::read.csv(
-      con,
-      header = TRUE,
-      check.names = FALSE,
-      stringsAsFactors = FALSE,
-      colClasses = "character"
-    ),
-    error = function(e) NULL
-  )
-
-  header_ok <- !is.null(df) && all(source_columns %in% names(df))
-
-  if (!header_ok) {
-    # Fall back to positional parsing, skipping a header line if present.
-    lines <- strsplit(text, "\r?\n")[[1]]
-    lines <- lines[nzchar(trimws(lines))]
-    cells <- strsplit(lines, ",")
-    header_row <- vapply(
-      cells[1],
-      function(r) identical(trimws(r)[seq_along(source_columns)], source_columns),
-      logical(1)
-    )
-    if (isTRUE(header_row)) {
-      cells <- cells[-1]
-    }
-    df <- as.data.frame(
-      do.call(rbind, lapply(cells, function(r) {
-        r <- trimws(r)
-        length(r) <- length(source_columns)  # pad short rows with NA
-        r
-      })),
-      stringsAsFactors = FALSE
-    )
-    names(df) <- source_columns
-  }
-
-  if (is.null(df) || nrow(df) == 0) {
+  # Split rows on any <br> variant (with optional surrounding whitespace) or a
+  # newline; then drop empties (the string often starts with a leading break).
+  parts <- unlist(strsplit(text, "\\s*<\\s*br\\s*/?\\s*>\\s*|\\r?\\n", perl = TRUE))
+  parts <- trimws(parts)
+  parts <- parts[nzchar(parts)]
+  if (length(parts) == 0) {
     return(NULL)
   }
 
-  # Select the source columns, rename to the target field names.
-  out <- df[, source_columns, drop = FALSE]
+  # Drop a leading header element if one is present (e.g. "Timestamp,Heart Rate").
+  first_cells <- trimws(strsplit(parts[[1]], ",")[[1]])
+  if (length(first_cells) >= length(source_columns) &&
+      identical(first_cells[seq_along(source_columns)], source_columns)) {
+    parts <- parts[-1]
+  }
+  if (length(parts) == 0) {
+    return(NULL)
+  }
+
+  ncol <- length(target_fields)
+  mat <- do.call(rbind, lapply(strsplit(parts, ","), function(cells) {
+    cells <- trimws(cells)
+    length(cells) <- ncol            # pad short rows / trim long ones to ncol
+    cells
+  }))
+
+  out <- as.data.frame(mat, stringsAsFactors = FALSE)
   names(out) <- target_fields
   tibble::as_tibble(out)
 }
@@ -145,10 +132,14 @@ target_fields_empty <- function(event_rows, target_fields) {
   TRUE
 }
 
-## Build the overwrite frame for one event: its existing rows + appended table
-## rows (metadata carried on every row, other fields blank on appended rows).
+## Build the overwrite frame for one event by EXPANDING it into N table rows
+## (N = number of parsed samples). This matches the Smartabase table layout:
+##   * metadata (start_date, user_id, about, event_id, ...) on EVERY row
+##   * non-table fields only on the FIRST row (NA elsewhere)
+##   * the table fields (Timestamp, Heart Rate) populated across all N rows
+## The event's non-table data is preserved on row 1; the empty table is filled.
 build_event_update <- function(event_rows, samples, target_fields) {
-  n_new <- nrow(samples)
+  n <- nrow(samples)
 
   meta_cols <- intersect(
     c("form", "start_date", "end_date", "start_time", "end_time",
@@ -156,25 +147,21 @@ build_event_update <- function(event_rows, samples, target_fields) {
     names(event_rows)
   )
 
-  # Make sure target columns exist on the existing rows (empty).
-  for (tf in target_fields) {
-    if (!tf %in% names(event_rows)) {
-      event_rows[[tf]] <- NA
-    }
+  # Base = the event's first (non-table) row, replicated N times.
+  base <- event_rows[rep(1, n), , drop = FALSE]
+
+  # Non-table fields repeat only on row 1; blank them on rows 2..N.
+  blank_cols <- setdiff(names(base), c(meta_cols, target_fields))
+  if (n > 1 && length(blank_cols) > 0) {
+    base[2:n, blank_cols] <- NA
   }
 
-  # Appended rows: copy metadata from the first existing row, blank everything
-  # else, then drop in the parsed Timestamp / Heart Rate values.
-  new_rows <- event_rows[rep(1, n_new), , drop = FALSE]
-  blank_cols <- setdiff(names(new_rows), c(meta_cols, target_fields))
-  if (length(blank_cols) > 0) {
-    new_rows[blank_cols] <- NA
-  }
-  for (tf in target_fields) {
-    new_rows[[tf]] <- samples[[tf]]
+  # Fill the table fields across every row (creates the columns if absent).
+  for (i in seq_along(target_fields)) {
+    base[[target_fields[[i]]]] <- samples[[target_fields[[i]]]]
   }
 
-  dplyr::bind_rows(event_rows, new_rows)
+  base
 }
 
 ## ---- Main ------------------------------------------------------------------
@@ -230,8 +217,8 @@ for (spec in timeseries_specs) {
 
     updates[[as.character(eid)]] <-
       build_event_update(event_rows, samples, target_fields)
-    log_status("  event ", eid, " (", event_rows$start_date[[1]], "): appending ",
-               nrow(samples), " row(s)")
+    log_status("  event ", eid, " (", event_rows$start_date[[1]], "): expanding to ",
+               nrow(samples), " table row(s)")
   }
 
   if (length(updates) == 0) {

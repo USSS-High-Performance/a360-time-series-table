@@ -9,14 +9,35 @@ Flow
 1. Authenticate with HTTP Basic Auth (v1 API).
 2. Sync users (/api/v1/usersynchronise) to get the list of user IDs the account
    can see.
-3. Search events (/api/v1/eventsearch) for each configured form, limited to
-   events DATED within the last LOOKBACK_HOURS. (We use eventsearch, not
-   synchronise: synchronise filters by last-modified time, not event date.)
+3. Sync events (/api/v1/synchronise) for each configured form using the
+   documented "preferred" incremental pattern: a persisted
+   lastSynchronisationTimeOnServer means each run returns only events created or
+   changed since the previous run.
 4. For every event whose target table fields are still empty, parse the CSV text
    in the source field into rows/columns and APPEND them to the event's existing
    rows (keeping all the original data intact).
 5. Push the merged event back with /api/v1/eventimport, using existingEventId so
    AMS updates the event in place instead of creating a new one.
+
+Why /synchronise and not /eventsearch
+-------------------------------------
+/eventsearch filters by the event's own date (startDate/finishDate). In this
+instance the server returned the full history oldest-first and did not honour the
+startDate lower bound, so a "last 24h" window never reached recent records.
+/synchronise filters by *modification* time instead: anything you just added or
+edited -- even an event dated years ago -- comes back as a recent change. That is
+exactly "find the new data", and it avoids paging through all of history.
+
+State
+-----
+lastSynchronisationTimeOnServer is persisted per-form in SB_STATE_FILE
+(default sync_state.json). The docs are explicit: persist it and pass it back;
+never hardcode 0 on every run (that forces a full history scan and can 500).
+
+  * First run (no state): full pull. Or set SB_SINCE_HOURS to seed the lower
+    bound to "now - N hours" for a quick recent-changes-only run.
+  * Later runs: only changed/new events. Fast.
+  * SB_FULL_RESYNC=true ignores stored state and pulls everything once.
 
 Configuration comes from environment variables (see below). Nothing is written
 back while SB_DRY_RUN is truthy (the default) -- the script pulls data down,
@@ -42,8 +63,26 @@ USERNAME = os.getenv("SB_USERNAME")
 PASSWORD = os.getenv("SB_PASSWORD")
 X_APP_ID = os.getenv("SB_APP_ID", "usss.integration.v1")
 
-# How far back to look for events to process.
+# Incremental-sync state (persisted lastSynchronisationTimeOnServer per form).
+STATE_FILE = os.getenv("SB_STATE_FILE", "sync_state.json")
+
+# Optional lower bound for the FIRST run only (when there is no stored state):
+#   set e.g. SB_SINCE_HOURS=24 to pull only events changed in the last 24h.
+#   Leave unset to pull the full history on first run.
+SINCE_HOURS = os.getenv("SB_SINCE_HOURS")  # None or an int-as-string
+
+# Ignore stored state and pull everything (then re-persist a fresh timestamp).
+FULL_RESYNC = os.getenv("SB_FULL_RESYNC", "false").lower() in ("true", "1", "yes")
+
+# Optional client-side guard: only PROCESS events whose event-date falls in the
+# last SB_LOOKBACK_HOURS. Off by default -- incremental sync already limits to
+# recent changes. Turn on with SB_DATE_FILTER=true if you also want to restrict
+# by the event's own startDate.
+DATE_FILTER = os.getenv("SB_DATE_FILTER", "false").lower() in ("true", "1", "yes")
 LOOKBACK_HOURS = int(os.getenv("SB_LOOKBACK_HOURS", "24"))
+
+# Safety cap so a first full sync can't loop forever on a runaway cursor.
+MAX_PAGES = int(os.getenv("SB_MAX_PAGES", "1000"))
 
 # Safety switch: while true, pull + report only, never write back.
 DRY_RUN = os.getenv("SB_DRY_RUN", "true").lower() not in ("false", "0", "no")
@@ -54,7 +93,7 @@ BASE_URL = f"https://{AMS_SERVER}/{AMS_APP}/api/v1"
 timeseries_dicts = [  # list of dictionaries
     {
         "form_name": "Polar Summary - Training",   # Teamworks AMS Form
-        "source_field": "Heart Rate Series",       # csv string field
+        "source_field": "Heart Rate Samples",      # csv string field
         "source_csv_columns": ["Timestamp", "Heart Rate"],  # csv string header
         "target_fields": ["Timestamp", "Heart Rate"],       # table fields to push to
     }
@@ -72,6 +111,22 @@ HEADERS = {
     "Content-Type": "application/json",
     "X-APP-ID": X_APP_ID,
 }
+
+
+# --------------------------------------------------------------------------- #
+# Persisted sync state
+# --------------------------------------------------------------------------- #
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as fh:
+        json.dump(state, fh, indent=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -121,52 +176,84 @@ def sync_users(last_sync_time=0, cached_user_ids=None):
 
 
 # --------------------------------------------------------------------------- #
-# Step 2: Search events by date  (POST /api/v1/eventsearch)
+# Step 2: Sync events  (POST /api/v1/synchronise)
 #
-# NOTE: We deliberately use /eventsearch, not /synchronise.
-#   * /synchronise filters by lastSynchronisationTimeOnServer, which is a
-#     *last-modified* cursor for incremental caching -- it does NOT filter by
-#     the event's own date. Passing "now - 24h" there returns only events
-#     edited in the last 24h, so events dated today but entered earlier are
-#     missed (this is why a date-window query returned 0 events).
-#   * /eventsearch does real server-side date filtering via startDate /
-#     finishDate in dd/mm/yyyy, which is what we want here.
+# NOTE on pagination shape: /synchronise takes a NESTED pagination object
+#   {"pagination": {"paginate": true, "cursor": "..."}}
+# (this differs from /eventsearch, which uses top-level paginate/cursor).
 # --------------------------------------------------------------------------- #
-def search_events(form_name, user_ids, start_date, finish_date):
-    """Return events for a form whose date falls within [start_date, finish_date].
+def extract_events(data):
+    """Pull the events list out of a /synchronise response.
 
-    Dates are dd/mm/yyyy strings. Follows cursor pagination. Returns event dicts.
+    Different AMS versions nest events differently; handle the known shapes.
+    """
+    if isinstance(data.get("export"), dict) and "events" in data["export"]:
+        return data["export"]["events"]
+    if "events" in data:
+        return data["events"]
+    return []
+
+
+def next_cursor(data):
+    """Return the pagination cursor from a response, or None on the last page."""
+    if isinstance(data.get("pagination"), dict):
+        cur = data["pagination"].get("cursor")
+        if cur:
+            return cur
+    return data.get("cursor") or data.get("next_cursor")
+
+
+def sync_events(form_name, user_ids, last_sync_time):
+    """Return (events, new_last_sync_time) for a form since last_sync_time.
+
+    Follows cursor pagination to completion. last_sync_time is a server epoch-ms
+    timestamp; 0 pulls the full history.
     """
     events = []
-    cursor = None  # omit on first page
+    cursor = None
+    new_last_sync = last_sync_time
+    page = 0
 
     while True:
-        payload = {
-            "formNames": [form_name],   # eventsearch takes a LIST of form names
-            "startDate": start_date,    # dd/mm/yyyy, inclusive lower bound
-            "finishDate": finish_date,  # dd/mm/yyyy, inclusive upper bound
-            "userIds": user_ids,
-            "paginate": True,           # top-level pagination for eventsearch
-        }
+        page += 1
+        pagination = {"paginate": True}
         if cursor:
-            payload["cursor"] = cursor
+            pagination["cursor"] = cursor
 
+        payload = {
+            "formName": form_name,
+            "lastSynchronisationTimeOnServer": last_sync_time,
+            "userIds": user_ids,
+            "pagination": pagination,
+        }
         resp = requests.post(
-            f"{BASE_URL}/eventsearch?informat=json&format=json",
+            f"{BASE_URL}/synchronise?informat=json&format=json",
             headers=HEADERS,
             json=payload,
         )
         resp.raise_for_status()
         data = resp.json()
 
-        events.extend(data.get("events", []))
+        if page == 1:
+            # One-time diagnostic: show the real top-level response shape so the
+            # events key / cursor key can be confirmed against your instance.
+            print(f"    [debug] response keys: {sorted(data.keys())}")
 
-        # Docs prose says next_cursor; OpenAPI schema says cursor. Accept either.
-        cursor = data.get("next_cursor") or data.get("cursor")
+        batch = extract_events(data)
+        events.extend(batch)
+        new_last_sync = data.get("lastSynchronisationTimeOnServer", new_last_sync)
+
+        cursor = next_cursor(data)
         if not cursor:
             break
+        if page >= MAX_PAGES:
+            print(f"    [warn] hit MAX_PAGES={MAX_PAGES}; stopping early. "
+                  f"Raise SB_MAX_PAGES to pull the rest.")
+            break
+        if page % 10 == 0:
+            print(f"    ...page {page}, {len(events)} events so far")
 
-    return events
+    return events, new_last_sync
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +279,17 @@ def pair_value(event, field_name):
 def target_fields_empty(event, target_fields):
     """True when none of the target fields hold a value yet (nothing appended)."""
     return all(pair_value(event, field) is None for field in target_fields)
+
+
+def event_date(event):
+    """Parse an event's startDate (dd/mm/yyyy) into a date, or None."""
+    raw = event.get("startDate")
+    if not raw:
+        return None
+    try:
+        return datetime.datetime.strptime(raw, "%d/%m/%Y").date()
+    except ValueError:
+        return None
 
 
 def parse_csv_field(text, source_columns, target_fields):
@@ -280,25 +378,35 @@ def import_event(payload):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def resolve_last_sync(state, form_name):
+    """Decide the lastSynchronisationTimeOnServer to send for a form."""
+    if FULL_RESYNC:
+        return 0
+    if form_name in state:
+        return state[form_name]
+    if SINCE_HOURS:
+        since = datetime.datetime.now() - datetime.timedelta(hours=int(SINCE_HOURS))
+        return int(since.timestamp() * 1000)
+    return 0  # first run, full history
+
+
 def main():
     now = datetime.datetime.now()
     window_start = now - datetime.timedelta(hours=LOOKBACK_HOURS)
-    # /eventsearch filters by the event's own date (dd/mm/yyyy). Date granularity
-    # means we widen to whole days so nothing in the window is missed; if the
-    # lookback crosses midnight this naturally spans yesterday..today.
-    start_date = window_start.strftime("%d/%m/%Y")
-    finish_date = now.strftime("%d/%m/%Y")
 
     print(f"Mode: {'DRY RUN (no writes)' if DRY_RUN else 'LIVE (will push back)'}")
-    print(f"Searching events dated {start_date} .. {finish_date} "
-          f"(last {LOOKBACK_HOURS}h)")
+    if DATE_FILTER:
+        print(f"Client-side date filter ON: keeping events dated "
+              f"{window_start:%d/%m/%Y}..{now:%d/%m/%Y}")
+
+    state = load_state()
 
     # Step 1: users
     user_cache, _ = sync_users()
     user_ids = list(user_cache.keys())
     print(f"Synced {len(user_ids)} users")
 
-    dump = {}          # form_name -> raw events, saved for inspection
+    dump = {}          # form_name -> processed events, saved for inspection
     total_updates = 0
 
     for spec in timeseries_dicts:
@@ -307,33 +415,46 @@ def main():
         source_columns = spec["source_csv_columns"]
         target_fields = spec["target_fields"]
 
-        # Step 2: events for this form in the date window
-        events = search_events(form_name, user_ids, start_date, finish_date)
+        last_sync = resolve_last_sync(state, form_name)
+        mode = ("full history" if last_sync == 0
+                else f"changes since server ts {last_sync}")
+        print(f"\nForm '{form_name}': syncing ({mode})")
+
+        # Step 2: events for this form
+        events, new_last_sync = sync_events(form_name, user_ids, last_sync)
+
+        # Optional client-side date-window guard.
+        if DATE_FILTER:
+            before = len(events)
+            events = [
+                e for e in events
+                if (d := event_date(e)) and window_start.date() <= d <= now.date()
+            ]
+            print(f"  date filter kept {len(events)}/{before} events")
+
+        # Newest-first so the most recent records surface first in logs/dump.
+        events.sort(key=lambda e: event_date(e) or datetime.date.min, reverse=True)
         dump[form_name] = events
-        print(f"\nForm '{form_name}': {len(events)} event(s) in window")
+        print(f"  {len(events)} event(s) to consider")
 
         for event in events:
             event_id = event.get("id")
 
             # Only process events whose table fields are still empty.
             if not target_fields_empty(event, target_fields):
-                print(f"  event {event_id}: target fields already populated -> skip")
                 continue
 
             csv_text = pair_value(event, source_field)
             if not csv_text:
-                print(f"  event {event_id}: source field '{source_field}' empty -> skip")
                 continue
 
             new_rows_pairs = parse_csv_field(csv_text, source_columns, target_fields)
             if not new_rows_pairs:
-                print(f"  event {event_id}: nothing parsed from source field -> skip")
                 continue
 
             payload = build_import_payload(event, form_name, new_rows_pairs)
-
-            print(f"  event {event_id}: appending {len(new_rows_pairs)} row(s) "
-                  f"(existing rows: {len(get_rows(event))})")
+            print(f"  event {event_id} ({event.get('startDate')}): appending "
+                  f"{len(new_rows_pairs)} row(s) (existing rows: {len(get_rows(event))})")
 
             if DRY_RUN:
                 continue
@@ -342,16 +463,25 @@ def main():
             total_updates += 1
             print(f"  event {event_id}: pushed back successfully")
 
+        # Advance the persisted sync timestamp only on a real (live) run, so
+        # repeated dry-runs stay reproducible and keep pulling the same window.
+        if new_last_sync and not DRY_RUN:
+            state[form_name] = new_last_sync
+
+    if not DRY_RUN:
+        save_state(state)
+
     # Save what we pulled so the exact JSON shape can be inspected / shared.
     with open("events_dump.json", "w") as fh:
         json.dump(dump, fh, indent=2)
     print(f"\nSaved pulled events to events_dump.json")
 
     if DRY_RUN:
-        print("DRY RUN complete -- no events were written. "
-              "Set SB_DRY_RUN=false to push.")
+        print("DRY RUN complete -- no events were written, sync state NOT "
+              "advanced. Set SB_DRY_RUN=false to push and enable incremental sync.")
     else:
-        print(f"Done. Pushed {total_updates} event(s).")
+        print(f"Done. Pushed {total_updates} event(s). "
+              f"Persisted sync state to {STATE_FILE}.")
 
 
 if __name__ == "__main__":

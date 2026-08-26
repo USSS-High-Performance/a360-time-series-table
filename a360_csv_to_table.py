@@ -56,7 +56,7 @@ BASE_URL = f"https://{AMS_SERVER}/{AMS_APP}/api/v1"
 timeseries_dicts = [  # list of dictionaries
     {
         "form_name": "Polar Summary - Training",   # Teamworks AMS Form
-        "source_field": "Heart Rate Samples",       # csv string field
+        "source_field": "Split Heart Rates",       # csv string field
         "source_csv_columns": ["Timestamp", "Heart Rate"],  # csv string header
         "target_fields": ["Timestamp", "Heart Rate"],       # table fields to push to
     }
@@ -147,6 +147,7 @@ def search_events(form_name, user_ids, start_date, finish_date):
             "formNames": [form_name],   # eventsearch takes a LIST of form names
             "startDate": start_date,    # dd/mm/yyyy, inclusive lower bound
             "finishDate": finish_date,  # dd/mm/yyyy, inclusive upper bound
+            "resultsPerUser": 1,
             "userIds": user_ids,
             "paginate": True,           # top-level pagination for eventsearch
         }
@@ -316,7 +317,6 @@ def main():
 
         for event in events:
             event_id = event.get("id")
-
             # Only process events whose table fields are still empty.
             if not target_fields_empty(event, target_fields):
                 print(f"  event {event_id}: target fields already populated -> skip")

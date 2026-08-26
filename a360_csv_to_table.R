@@ -30,7 +30,8 @@
 
 library(dplyr)
 library(smartabaseR)
-
+library(dotenv)
+load_dot_env()
 ## ---- Configuration ---------------------------------------------------------
 sb_url      <- Sys.getenv("SB_URL", "usopc.smartabase.com/athlete360-usss")
 sb_username <- Sys.getenv("SB_USERNAME")
@@ -55,8 +56,8 @@ timeseries_specs <- list(
 
 ## Date range (dd/mm/YYYY). Explicit SB_START_DATE/SB_END_DATE win; otherwise a
 ## rolling window of SB_LOOKBACK_DAYS ending today.
-lookback_days <- suppressWarnings(as.integer(Sys.getenv("SB_LOOKBACK_DAYS", "7")))
-if (is.na(lookback_days)) lookback_days <- 7L
+lookback_days <- suppressWarnings(as.integer(Sys.getenv("SB_LOOKBACK_DAYS", "1")))
+if (is.na(lookback_days)) lookback_days <- 1L
 
 end_date <- Sys.getenv("SB_END_DATE", format(Sys.Date(), "%d/%m/%Y"))
 start_env <- Sys.getenv("SB_START_DATE", "")

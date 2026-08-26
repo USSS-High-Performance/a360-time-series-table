@@ -1,19 +1,27 @@
 ## a360_csv_to_table.R ##########################################################
 ##
 ## Convert a CSV-string field on Teamworks AMS (Smartabase) events into repeating
-## table rows, and push the result back onto the SAME events using smartabaseR.
+## table rows, and push the result into a SEPARATE "time series" form using
+## smartabaseR.
 ##
-## R port of a360_csv_to_table.py. Same idea:
-##   1. Pull events for a form over a date range      -> sb_get_event()
-##   2. For each event whose target table fields are   -> parse the CSV string
-##      still empty, split the source CSV field into      in `source_field`
+## Flow:
+##   1. Pull events for the SOURCE form over a date range   -> sb_get_event()
+##   2. For each event, split the source CSV field into      -> parse_samples()
 ##      Timestamp / Heart Rate rows
-##   3. Append those rows to the event and overwrite   -> sb_update_event()
-##      the event in place (existing data preserved)
+##   3. Create a NEW event in the TARGET form carrying:       -> sb_insert_event()
+##        * ID, Detailed Sport Info   (copied from the source event, row 1 only)
+##        * Timestamp, Heart Rate      (table fields, one row per sample)
+##        * the same athlete + date    (user_id / start_date from the source)
 ##
-## Why sb_update_event(): "updating" in Smartabase overwrites the whole event, so
-## we build each event from its FULL sb_get_event() output (every existing field
-## + event_id) and expand it into one table row per sample. Nothing else is lost.
+## Why a separate form + sb_insert_event(): the Timestamp/Heart Rate table can be
+## thousands of rows, so it lives in its own "Polar Summary - Training - Time
+## Series" form instead of being pushed back onto the training-summary event.
+## We create fresh events there (insert, not update); the source form is only
+## read, never modified.
+##
+## Idempotency: before inserting we read the target form over the same window and
+## skip any source event whose ID already exists there, so re-running does not
+## create duplicates.
 ##
 ## Credentials are read from environment variables -- never hardcode them here:
 ##   SB_URL       e.g. usopc.smartabase.com/athlete360-usss   (has a default)
@@ -21,17 +29,17 @@
 ##   SB_PASSWORD  AMS password                                 (required)
 ##
 ## Date range (configurable; dd/mm/YYYY). Defaults to the last SB_LOOKBACK_DAYS.
-## To reach older records (e.g. 2020-dated events) widen it, for example:
-##   SB_START_DATE=01/01/2015   or   SB_LOOKBACK_DAYS=4000
+## To reach older records widen it, e.g. SB_START_DATE=01/01/2015.
 ##
 ## SB_DRY_RUN=true (default) pulls + reports + writes a preview CSV, but does NOT
-## call sb_update_event(). Set SB_DRY_RUN=false to actually push.
+## call sb_insert_event(). Set SB_DRY_RUN=false to actually push.
 ################################################################################
 
 library(dplyr)
 library(smartabaseR)
 library(dotenv)
 load_dot_env()
+
 ## ---- Configuration ---------------------------------------------------------
 sb_url      <- Sys.getenv("SB_URL", "usopc.smartabase.com/athlete360-usss")
 sb_username <- Sys.getenv("SB_USERNAME")
@@ -49,20 +57,24 @@ dry_run <- tolower(Sys.getenv("SB_DRY_RUN", "true")) %in% c("true", "1", "yes")
 # RStudio session if you want the confirmation prompt.
 interactive_mode <- tolower(Sys.getenv("SB_INTERACTIVE", "false")) %in% c("true", "1", "yes")
 
-## Form / source field / column mapping (mirrors the Python timeseries_dicts).
+## Source form / target form / field mapping.
 ##
-## readonly_fields: fields we must NOT write back. "Split Heart Rates" is a
-## LINKED field (its value comes from another form), so it is read-only on this
-## form -- we read it to parse, but we drop it from the update payload so we
-## don't attempt an illegal write. The link re-resolves on Smartabase's side, so
-## the value is preserved untouched.
+##   source_field  : long CSV-string field on the source form to parse
+##   source_columns: the header order encoded in that string
+##   target_fields : table columns to create in the target form
+##   carry_fields  : non-table fields copied verbatim from source -> target
+##                   (must exist with the SAME name on both forms)
+##   dedup_field   : a carry field that uniquely identifies the source session;
+##                   an existing target event with this value is not re-inserted
 timeseries_specs <- list(
   list(
-    form_name      = "Polar Summary - Training",  # Teamworks AMS form
-    source_field   = "Split Heart Rates",         # CSV-string field to parse
-    source_columns = c("Timestamp", "Heart Rate"),# header in that CSV string
-    target_fields  = c("Timestamp", "Heart Rate"),# table fields to populate
-    readonly_fields = c("Split Heart Rates")      # linked field: read, never write
+    source_form    = "Polar Summary - Training",
+    target_form    = "Polar Summary - Training - Time Series",
+    source_field   = "Split Heart Rates",           # CSV-string field to parse
+    source_columns = c("Timestamp", "Heart Rate"),  # header order in that string
+    target_fields  = c("Timestamp", "Heart Rate"),  # table fields on target form
+    carry_fields   = c("ID", "Detailed Sport Info"),# non-table fields to copy
+    dedup_field    = "ID"                            # skip if already in target
   )
 )
 
@@ -131,44 +143,32 @@ parse_samples <- function(text, source_columns, target_fields) {
   tibble::as_tibble(out)
 }
 
-## TRUE when none of the target fields hold a value for this event's rows.
-target_fields_empty <- function(event_rows, target_fields) {
-  for (tf in target_fields) {
-    if (tf %in% names(event_rows)) {
-      vals <- trimws(as.character(event_rows[[tf]]))
-      if (any(!is.na(vals) & vals != "")) {
-        return(FALSE)
-      }
-    }
-  }
-  TRUE
-}
-
-## Build the overwrite frame for one event by EXPANDING it into N table rows
-## (N = number of parsed samples). This matches the Smartabase table layout:
-##   * metadata (start_date, user_id, about, event_id, ...) on EVERY row
-##   * non-table fields only on the FIRST row (NA elsewhere)
+## Build the INSERT frame for one target event by expanding it into N table rows
+## (N = number of parsed samples). Matches the Smartabase table layout:
+##   * user_id + date metadata on EVERY row (keeps athlete/date aligned)
+##   * carry (non-table) fields only on the FIRST row (NA elsewhere)
 ##   * the table fields (Timestamp, Heart Rate) populated across all N rows
-## The event's non-table data is preserved on row 1; the empty table is filled.
-build_event_update <- function(event_rows, samples, target_fields) {
+## Only these columns are kept -- the source form's other fields (incl. the raw
+## "Split Heart Rates" blob and the source event_id) are intentionally dropped.
+build_event_insert <- function(event_rows, samples, target_fields, carry_fields) {
   n <- nrow(samples)
 
   meta_cols <- intersect(
-    c("form", "start_date", "end_date", "start_time", "end_time",
-      "user_id", "about", "username", "event_id"),
+    c("start_date", "end_date", "start_time", "end_time", "user_id"),
     names(event_rows)
   )
+  carry_present <- intersect(carry_fields, names(event_rows))
+  keep_cols <- c(meta_cols, carry_present)
 
-  # Base = the event's first (non-table) row, replicated N times.
-  base <- event_rows[rep(1, n), , drop = FALSE]
+  # Base = the event's first row (metadata + carry fields), replicated N times.
+  base <- event_rows[rep(1, n), keep_cols, drop = FALSE]
 
-  # Non-table fields repeat only on row 1; blank them on rows 2..N.
-  blank_cols <- setdiff(names(base), c(meta_cols, target_fields))
-  if (n > 1 && length(blank_cols) > 0) {
-    base[2:n, blank_cols] <- NA
+  # Carry (non-table) fields belong only on row 1; blank them on rows 2..N.
+  if (n > 1 && length(carry_present) > 0) {
+    base[2:n, carry_present] <- NA
   }
 
-  # Fill the table fields across every row (creates the columns if absent).
+  # Fill the table fields across every row.
   for (i in seq_along(target_fields)) {
     base[[target_fields[[i]]]] <- samples[[target_fields[[i]]]]
   }
@@ -176,20 +176,44 @@ build_event_update <- function(event_rows, samples, target_fields) {
   base
 }
 
+## Read the IDs already present in the target form so we don't re-insert them.
+## A brand-new/empty form may make sb_get_event() error or return nothing --
+## treat that as "no existing events".
+existing_target_ids <- function(target_form, dedup_field, start_date, end_date) {
+  existing <- tryCatch(
+    sb_get_event(
+      form = target_form,
+      date_range = c(start_date, end_date),
+      url = sb_url,
+      username = sb_username,
+      password = sb_password
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(existing) || nrow(existing) == 0 ||
+      !dedup_field %in% names(existing)) {
+    return(character(0))
+  }
+  ids <- unique(trimws(as.character(existing[[dedup_field]])))
+  ids[nzchar(ids) & !is.na(ids)]
+}
+
 ## ---- Main ------------------------------------------------------------------
-log_status("Mode: ", if (dry_run) "DRY RUN (no writes)" else "LIVE (will push back)")
+log_status("Mode: ", if (dry_run) "DRY RUN (no writes)" else "LIVE (will insert)")
 log_status("Date range: ", start_date, " .. ", end_date)
 
 for (spec in timeseries_specs) {
-  form_name      <- spec$form_name
+  source_form    <- spec$source_form
+  target_form    <- spec$target_form
   source_field   <- spec$source_field
   source_columns <- spec$source_columns
   target_fields  <- spec$target_fields
-  readonly_fields <- if (is.null(spec$readonly_fields)) character(0) else spec$readonly_fields
+  carry_fields   <- if (is.null(spec$carry_fields)) character(0) else spec$carry_fields
+  dedup_field    <- spec$dedup_field %||% NA_character_
 
-  log_status("\nForm '", form_name, "': fetching events")
+  log_status("\nSource form '", source_form, "' -> target form '", target_form, "'")
   events <- sb_get_event(
-    form = form_name,
+    form = source_form,
     date_range = c(start_date, end_date),
     url = sb_url,
     username = sb_username,
@@ -197,29 +221,48 @@ for (spec in timeseries_specs) {
   )
 
   if (is.null(events) || nrow(events) == 0) {
-    log_status("  no events returned for this window")
+    log_status("  no source events returned for this window")
     next
   }
-
   if (!"event_id" %in% names(events)) {
-    stop("sb_get_event() did not return an event_id column for ", form_name,
-         "; cannot update in place.")
+    stop("sb_get_event() did not return an event_id column for ", source_form)
   }
   if (!source_field %in% names(events)) {
     log_status("  source field '", source_field, "' not present on this form; skipping")
     next
   }
 
-  event_ids <- unique(events$event_id)
-  log_status("  ", nrow(events), " row(s) across ", length(event_ids), " event(s)")
+  missing_carry <- setdiff(carry_fields, names(events))
+  if (length(missing_carry) > 0) {
+    log_status("  WARNING: carry field(s) not found on source form (will be blank): ",
+               paste(missing_carry, collapse = ", "))
+  }
 
-  updates <- list()
+  # IDs already in the target form -> skip those source events (dedup).
+  skip_ids <- character(0)
+  if (!is.na(dedup_field) && nzchar(dedup_field)) {
+    skip_ids <- existing_target_ids(target_form, dedup_field, start_date, end_date)
+    if (length(skip_ids) > 0) {
+      log_status("  target form already has ", length(skip_ids),
+                 " event(s) in this window; those IDs will be skipped")
+    }
+  }
+
+  event_ids <- unique(events$event_id)
+  log_status("  ", nrow(events), " source row(s) across ", length(event_ids), " event(s)")
+
+  inserts <- list()
   for (eid in event_ids) {
     event_rows <- events %>% filter(.data$event_id == eid)
 
-    # Skip events whose table is already populated.
-    if (!target_fields_empty(event_rows, target_fields)) {
-      next
+    # Dedup: skip if this source session already exists in the target form.
+    if (!is.na(dedup_field) && dedup_field %in% names(event_rows)) {
+      dedup_val <- trimws(as.character(event_rows[[dedup_field]][[1]]))
+      if (nzchar(dedup_val) && dedup_val %in% skip_ids) {
+        log_status("  event ", eid, " (", dedup_field, "=", dedup_val,
+                   "): already in target; skipping")
+        next
+      }
     }
 
     csv_text <- event_rows[[source_field]][[1]]
@@ -228,40 +271,28 @@ for (spec in timeseries_specs) {
       next
     }
 
-    updates[[as.character(eid)]] <-
-      build_event_update(event_rows, samples, target_fields)
-    log_status("  event ", eid, " (", event_rows$start_date[[1]], "): expanding to ",
-               nrow(samples), " table row(s)")
+    inserts[[as.character(eid)]] <-
+      build_event_insert(event_rows, samples, target_fields, carry_fields)
+    log_status("  event ", eid, " (", event_rows$start_date[[1]], "): ",
+               nrow(samples), " sample row(s) -> target insert")
   }
 
-  if (length(updates) == 0) {
-    log_status("  nothing to update (targets already filled or no source data)")
+  if (length(inserts) == 0) {
+    log_status("  nothing to insert (all skipped or no source data)")
     next
   }
 
-  update_df <- dplyr::bind_rows(updates)
+  insert_df <- dplyr::bind_rows(inserts)
 
-  # Drop read-only / linked fields (e.g. "Split Heart Rates") from the payload:
-  # we can't write them, and leaving them out keeps their link intact on the
-  # event rather than attempting an illegal overwrite.
-  drop_cols <- intersect(readonly_fields, names(update_df))
-  if (length(drop_cols) > 0) {
-    update_df <- update_df[, setdiff(names(update_df), drop_cols), drop = FALSE]
-    log_status("  dropped read-only/linked field(s) from push: ",
-               paste(drop_cols, collapse = ", "))
-  }
-
-  # Preview to disk so the frame can be inspected before pushing. IMPORTANT:
-  # this is only for human inspection -- the value pushed to sb_update_event()
-  # is the full update_df. We truncate oversized text cells (e.g. the preserved
-  # raw "Split Heart Rates" blob, ~128 KB on row 1) because Excel caps a single
-  # cell at 32,767 characters and otherwise spills it across columns, making the
-  # preview look mangled even though the underlying data is correct.
+  # Preview to disk so the frame can be inspected before pushing. This is only
+  # for human inspection -- the value pushed to sb_insert_event() is insert_df.
+  # We truncate oversized text cells because Excel caps a single cell at 32,767
+  # characters and otherwise spills long values across columns.
   preview_path <- paste0(
-    "update_preview_", gsub("[^A-Za-z0-9]+", "_", form_name), ".csv"
+    "insert_preview_", gsub("[^A-Za-z0-9]+", "_", target_form), ".csv"
   )
   preview_max_chars <- 80L
-  preview_df <- update_df
+  preview_df <- insert_df
   preview_df[] <- lapply(preview_df, function(col) {
     if (is.character(col)) {
       long <- !is.na(col) & nchar(col) > preview_max_chars
@@ -272,27 +303,24 @@ for (spec in timeseries_specs) {
   })
   utils::write.csv(preview_df, preview_path, row.names = FALSE, na = "")
   log_status("  wrote preview: ", preview_path,
-             " (", nrow(update_df), " rows, ", length(updates), " events; ",
-             "long cells truncated for readability)")
+             " (", nrow(insert_df), " rows, ", length(inserts), " event(s))")
 
   if (dry_run) {
-    log_status("  DRY RUN -- not calling sb_update_event(). ",
+    log_status("  DRY RUN -- not calling sb_insert_event(). ",
                "Set SB_DRY_RUN=false to push.")
     next
   }
 
-  # NOTE: table_field lists ONLY the fields we populate (Timestamp, Heart Rate).
-  # The Polar Summary events observed are single-row (no other table fields), so
-  # this is safe. If this form ever gains OTHER table fields, add their names
-  # here too -- otherwise sb_update_event() would treat them as non-table and
-  # keep only their first-row value.
-  sb_update_event(
-    df = update_df,
-    form = form_name,
+  # table_field lists ONLY the fields that vary per row (Timestamp, Heart Rate).
+  # ID / Detailed Sport Info are non-table and stay on row 1. user_id ties each
+  # new event to the source athlete; start_date keeps it on the session's date.
+  sb_insert_event(
+    df = insert_df,
+    form = target_form,
     url = sb_url,
     username = sb_username,
     password = sb_password,
-    option = sb_update_event_option(
+    option = sb_insert_event_option(
       table_field = target_fields,
       interactive_mode = interactive_mode
     )

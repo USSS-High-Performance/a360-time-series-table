@@ -3,6 +3,7 @@ __pycache__/
 events_dump.json
 sync_state.json
 update_preview_*.csv
+insert_preview_*.csv
 .Rhistory
 .RData
 .env

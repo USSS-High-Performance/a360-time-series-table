@@ -79,8 +79,8 @@ timeseries_specs <- list(
     source_field   = "Split Heart Rates",           # CSV-string field to parse
     source_columns = c("Timestamp", "Heart Rate"),  # header order in that string
     target_fields  = c("Timestamp", "Heart Rate"),  # table fields on target form
-    carry_fields   = c("ID", "Detailed Sport Info"),# non-table fields to copy
-    dedup_field    = "ID"                            # skip if already in target
+    carry_fields   = c("ID Text", "Detailed Sport Info Text"),# non-table fields to copy
+    dedup_field    = "ID Text"                            # skip if already in target
   )
 )
 

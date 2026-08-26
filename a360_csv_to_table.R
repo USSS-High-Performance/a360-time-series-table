@@ -75,12 +75,12 @@ if (is.na(sample_every) || sample_every < 1) sample_every <- 1L
 timeseries_specs <- list(
   list(
     source_form    = "Polar Summary - Training",
-    target_form    = "Polar Summary - Training - Time Series",
+    target_form    = "DEV Polar Summary - Training - Time Series",
     source_field   = "Split Heart Rates",           # CSV-string field to parse
     source_columns = c("Timestamp", "Heart Rate"),  # header order in that string
     target_fields  = c("Timestamp", "Heart Rate"),  # table fields on target form
-    carry_fields   = c("ID Text", "Detailed Sport Info Text"),# non-table fields to copy
-    dedup_field    = "ID Text"                            # skip if already in target
+    carry_fields   = c("ID - API", "Detailed Sport Info - API"),# non-table fields to copy
+    dedup_field    = "ID - API"                            # skip if already in target
   )
 )
 

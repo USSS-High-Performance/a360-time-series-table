@@ -56,7 +56,7 @@ BASE_URL = f"https://{AMS_SERVER}/{AMS_APP}/api/v1"
 timeseries_dicts = [  # list of dictionaries
     {
         "form_name": "Polar Summary - Training",   # Teamworks AMS Form
-        "source_field": "Heart Rate Series",       # csv string field
+        "source_field": "Heart Rate Samples",       # csv string field
         "source_csv_columns": ["Timestamp", "Heart Rate"],  # csv string header
         "target_fields": ["Timestamp", "Heart Rate"],       # table fields to push to
     }

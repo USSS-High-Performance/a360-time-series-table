@@ -228,13 +228,29 @@ for (spec in timeseries_specs) {
 
   update_df <- dplyr::bind_rows(updates)
 
-  # Preview to disk so the exact frame can be inspected before pushing.
+  # Preview to disk so the frame can be inspected before pushing. IMPORTANT:
+  # this is only for human inspection -- the value pushed to sb_update_event()
+  # is the full update_df. We truncate oversized text cells (e.g. the preserved
+  # raw "Split Heart Rates" blob, ~128 KB on row 1) because Excel caps a single
+  # cell at 32,767 characters and otherwise spills it across columns, making the
+  # preview look mangled even though the underlying data is correct.
   preview_path <- paste0(
     "update_preview_", gsub("[^A-Za-z0-9]+", "_", form_name), ".csv"
   )
-  utils::write.csv(update_df, preview_path, row.names = FALSE, na = "")
+  preview_max_chars <- 80L
+  preview_df <- update_df
+  preview_df[] <- lapply(preview_df, function(col) {
+    if (is.character(col)) {
+      long <- !is.na(col) & nchar(col) > preview_max_chars
+      col[long] <- paste0(substr(col[long], 1, preview_max_chars),
+                          "...[", nchar(col[long]), " chars total]")
+    }
+    col
+  })
+  utils::write.csv(preview_df, preview_path, row.names = FALSE, na = "")
   log_status("  wrote preview: ", preview_path,
-             " (", nrow(update_df), " rows, ", length(updates), " events)")
+             " (", nrow(update_df), " rows, ", length(updates), " events; ",
+             "long cells truncated for readability)")
 
   if (dry_run) {
     log_status("  DRY RUN -- not calling sb_update_event(). ",

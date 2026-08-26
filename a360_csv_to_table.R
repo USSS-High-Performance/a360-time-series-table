@@ -63,6 +63,13 @@ interactive_mode <- tolower(Sys.getenv("SB_INTERACTIVE", "false")) %in% c("true"
 sample_every <- suppressWarnings(as.integer(Sys.getenv("SB_SAMPLE_EVERY", "2")))
 if (is.na(sample_every) || sample_every < 1) sample_every <- 1L
 
+# For debugging a failing insert: cap the number of table rows sent per event
+# (e.g. SB_MAX_ROWS_PER_EVENT=3 sends a tiny event so a structural problem --
+# bad field name, no write access to the form -- shows up without pushing
+# thousands of rows). Empty/0 = no cap.
+max_rows_per_event <- suppressWarnings(as.integer(Sys.getenv("SB_MAX_ROWS_PER_EVENT", "0")))
+if (is.na(max_rows_per_event) || max_rows_per_event < 1) max_rows_per_event <- Inf
+
 ## Source form / target form / field mapping.
 ##
 ##   source_field  : long CSV-string field on the source form to parse
@@ -288,6 +295,11 @@ for (spec in timeseries_specs) {
       samples <- samples[seq(1, raw_n, by = sample_every), , drop = FALSE]
     }
 
+    # Debug cap: optionally send only the first few rows per event.
+    if (is.finite(max_rows_per_event) && nrow(samples) > max_rows_per_event) {
+      samples <- samples[seq_len(max_rows_per_event), , drop = FALSE]
+    }
+
     inserts[[as.character(eid)]] <-
       build_event_insert(event_rows, samples, target_fields, carry_fields)
     log_status("  event ", eid, " (", event_rows$start_date[[1]], "): ",
@@ -337,42 +349,66 @@ for (spec in timeseries_specs) {
   # table_field lists ONLY the fields that vary per row (Timestamp, Heart Rate).
   # ID / Detailed Sport Info are non-table and stay on row 1. user_id ties each
   # new event to the source athlete; start_date keeps it on the session's date.
+  # Dump the exact frame we send for the FIRST event so the columns/values
+  # actually going to the target form can be inspected (field names must match
+  # the target form exactly, and the API account must have write access to it).
+  first_df <- inserts[[1]]
+  debug_path <- paste0(
+    "insert_debug_", gsub("[^A-Za-z0-9]+", "_", target_form), ".csv"
+  )
+  utils::write.csv(utils::head(first_df, 5), debug_path, row.names = FALSE, na = "")
+  log_status("  wrote first-event debug frame: ", debug_path,
+             "  (columns going to target: ", paste(names(first_df), collapse = ", "), ")")
+
   n_ok <- 0L
   n_fail <- 0L
   for (eid in names(inserts)) {
     one_df <- inserts[[eid]]
-    res <- tryCatch(
-      sb_insert_event(
-        df = one_df,
-        form = target_form,
-        url = sb_url,
-        username = sb_username,
-        password = sb_password,
-        option = sb_insert_event_option(
-          table_field = target_fields,
-          interactive_mode = interactive_mode
-        )
+
+    # smartabaseR reports server-side problems by printing "! UNEXPECTED_ERROR"
+    # via cli (a message) and RETURNING -- it does not throw. That empty message
+    # hides the real cause, so capture every message/warning emitted during the
+    # call as well as the returned object, and surface all of it.
+    emitted <- character(0)
+    res <- withCallingHandlers(
+      tryCatch(
+        sb_insert_event(
+          df = one_df,
+          form = target_form,
+          url = sb_url,
+          username = sb_username,
+          password = sb_password,
+          option = sb_insert_event_option(
+            table_field = target_fields,
+            interactive_mode = interactive_mode
+          )
+        ),
+        error = function(e) {
+          emitted <<- c(emitted, paste0("ERROR: ", conditionMessage(e)))
+          structure(list(), class = "sb_insert_threw")
+        }
       ),
-      error = function(e) {
-        log_status("  event ", eid, ": INSERT THREW -- ", conditionMessage(e))
-        structure(list(), class = "sb_insert_threw")
+      message = function(m) {
+        emitted <<- c(emitted, trimws(conditionMessage(m)))
+        invokeRestart("muffleMessage")
+      },
+      warning = function(w) {
+        emitted <<- c(emitted, paste0("WARNING: ", conditionMessage(w)))
+        invokeRestart("muffleWarning")
       }
     )
 
-    # smartabaseR often does NOT throw on a server-side problem: it prints
-    # "! UNEXPECTED_ERROR" via cli and returns a result object instead. So we
-    # inspect the returned object rather than trusting "no error = success",
-    # and surface a compact form of it so the real status is visible.
-    res_txt <- paste(utils::capture.output(print(res)), collapse = " | ")
+    res_txt <- paste(c(emitted, utils::capture.output(str(res))), collapse = " | ")
     bad <- inherits(res, "sb_insert_threw") ||
-      grepl("UNEXPECTED_ERROR|FAILED|ERROR", res_txt, ignore.case = TRUE)
+      grepl("UNEXPECTED_ERROR|FAILED|ERROR|DENIED|PERMISSION|NOT_FOUND",
+            res_txt, ignore.case = TRUE)
     log_status("  event ", eid, ": ", if (bad) "PROBLEM" else "OK",
-               " (", nrow(one_df), " rows) -> ", substr(res_txt, 1, 400))
+               " (", nrow(one_df), " rows)")
+    log_status("    server said: ", substr(res_txt, 1, 800))
     if (bad) n_fail <- n_fail + 1L else n_ok <- n_ok + 1L
   }
   log_status("  insert summary for '", target_form, "': ",
-             n_ok, " ok, ", n_fail, " problem(s). ",
-             "Verify events landed in the target form regardless.")
+             n_ok, " ok, ", n_fail, " problem(s).")
 }
 
 log_status("\nDone.")

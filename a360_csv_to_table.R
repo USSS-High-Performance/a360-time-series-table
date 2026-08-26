@@ -42,7 +42,12 @@ if (!nzchar(sb_username) || !nzchar(sb_password)) {
 }
 
 dry_run <- tolower(Sys.getenv("SB_DRY_RUN", "true")) %in% c("true", "1", "yes")
-interactive_mode <- tolower(Sys.getenv("SB_INTERACTIVE", "true")) %in% c("true", "1", "yes")
+# interactive_mode = FALSE is required when running under Rscript: TRUE makes
+# smartabaseR show a menu() "Are you sure?" confirmation, which errors out
+# non-interactively ("menu() cannot be used non-interactively"). SB_DRY_RUN is
+# our real safety gate; set SB_INTERACTIVE=true only inside an interactive
+# RStudio session if you want the confirmation prompt.
+interactive_mode <- tolower(Sys.getenv("SB_INTERACTIVE", "false")) %in% c("true", "1", "yes")
 
 ## Form / source field / column mapping (mirrors the Python timeseries_dicts).
 ##

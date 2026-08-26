@@ -341,7 +341,7 @@ for (spec in timeseries_specs) {
   n_fail <- 0L
   for (eid in names(inserts)) {
     one_df <- inserts[[eid]]
-    ok <- tryCatch({
+    res <- tryCatch(
       sb_insert_event(
         df = one_df,
         form = target_form,
@@ -352,21 +352,27 @@ for (spec in timeseries_specs) {
           table_field = target_fields,
           interactive_mode = interactive_mode
         )
-      )
-      TRUE
-    }, error = function(e) {
-      log_status("  event ", eid, ": INSERT FAILED -- ", conditionMessage(e))
-      FALSE
-    })
-    if (isTRUE(ok)) {
-      n_ok <- n_ok + 1L
-      log_status("  event ", eid, ": inserted (", nrow(one_df), " rows)")
-    } else {
-      n_fail <- n_fail + 1L
-    }
+      ),
+      error = function(e) {
+        log_status("  event ", eid, ": INSERT THREW -- ", conditionMessage(e))
+        structure(list(), class = "sb_insert_threw")
+      }
+    )
+
+    # smartabaseR often does NOT throw on a server-side problem: it prints
+    # "! UNEXPECTED_ERROR" via cli and returns a result object instead. So we
+    # inspect the returned object rather than trusting "no error = success",
+    # and surface a compact form of it so the real status is visible.
+    res_txt <- paste(utils::capture.output(print(res)), collapse = " | ")
+    bad <- inherits(res, "sb_insert_threw") ||
+      grepl("UNEXPECTED_ERROR|FAILED|ERROR", res_txt, ignore.case = TRUE)
+    log_status("  event ", eid, ": ", if (bad) "PROBLEM" else "OK",
+               " (", nrow(one_df), " rows) -> ", substr(res_txt, 1, 400))
+    if (bad) n_fail <- n_fail + 1L else n_ok <- n_ok + 1L
   }
   log_status("  insert summary for '", target_form, "': ",
-             n_ok, " succeeded, ", n_fail, " failed")
+             n_ok, " ok, ", n_fail, " problem(s). ",
+             "Verify events landed in the target form regardless.")
 }
 
 log_status("\nDone.")

@@ -38,8 +38,8 @@ from base64 import b64encode
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-AMS_SERVER = os.getenv("SB_SERVER", "your-server.smartabase.com")  # host only
-AMS_APP = os.getenv("SB_APP", "your-site")                         # site / app id
+AMS_SERVER = os.getenv("SB_SERVER", "usopc.smartabase.com")  # host only
+AMS_APP = os.getenv("SB_APP", "athlete360-usss")                         # site / app id
 USERNAME = os.getenv("SB_USERNAME")
 PASSWORD = os.getenv("SB_PASSWORD")
 X_APP_ID = os.getenv("SB_APP_ID", "usss.integration.v1")

@@ -45,12 +45,19 @@ dry_run <- tolower(Sys.getenv("SB_DRY_RUN", "true")) %in% c("true", "1", "yes")
 interactive_mode <- tolower(Sys.getenv("SB_INTERACTIVE", "true")) %in% c("true", "1", "yes")
 
 ## Form / source field / column mapping (mirrors the Python timeseries_dicts).
+##
+## readonly_fields: fields we must NOT write back. "Split Heart Rates" is a
+## LINKED field (its value comes from another form), so it is read-only on this
+## form -- we read it to parse, but we drop it from the update payload so we
+## don't attempt an illegal write. The link re-resolves on Smartabase's side, so
+## the value is preserved untouched.
 timeseries_specs <- list(
   list(
     form_name      = "Polar Summary - Training",  # Teamworks AMS form
     source_field   = "Split Heart Rates",         # CSV-string field to parse
     source_columns = c("Timestamp", "Heart Rate"),# header in that CSV string
-    target_fields  = c("Timestamp", "Heart Rate") # table fields to populate
+    target_fields  = c("Timestamp", "Heart Rate"),# table fields to populate
+    readonly_fields = c("Split Heart Rates")      # linked field: read, never write
   )
 )
 
@@ -173,6 +180,7 @@ for (spec in timeseries_specs) {
   source_field   <- spec$source_field
   source_columns <- spec$source_columns
   target_fields  <- spec$target_fields
+  readonly_fields <- if (is.null(spec$readonly_fields)) character(0) else spec$readonly_fields
 
   log_status("\nForm '", form_name, "': fetching events")
   events <- sb_get_event(
@@ -227,6 +235,16 @@ for (spec in timeseries_specs) {
   }
 
   update_df <- dplyr::bind_rows(updates)
+
+  # Drop read-only / linked fields (e.g. "Split Heart Rates") from the payload:
+  # we can't write them, and leaving them out keeps their link intact on the
+  # event rather than attempting an illegal overwrite.
+  drop_cols <- intersect(readonly_fields, names(update_df))
+  if (length(drop_cols) > 0) {
+    update_df <- update_df[, setdiff(names(update_df), drop_cols), drop = FALSE]
+    log_status("  dropped read-only/linked field(s) from push: ",
+               paste(drop_cols, collapse = ", "))
+  }
 
   # Preview to disk so the frame can be inspected before pushing. IMPORTANT:
   # this is only for human inspection -- the value pushed to sb_update_event()

@@ -146,5 +146,17 @@ rows_multi <- lapply(seq_along(timestamps), function(i) {
 })
 send("A6 multi-row table (3 samples)", build_payload(rows_multi, as.integer(user_id)))
 
+# 7: row 0 = carry (non-table) fields ONLY; table fields start at row 1.
+rows_split <- c(
+  list(list(row = 0L, pairs = list(pair("ID - API", id_api),
+                                    pair("Detailed Sport Info - API", sport_info)))),
+  lapply(seq_along(timestamps), function(i) {
+    list(row = i, pairs = list(pair("Timestamp", timestamps[[i]]),
+                               pair("Heart Rate", heart_rates[[i]])))
+  })
+)
+send("A7 row0=carry only, table rows start at row 1",
+     build_payload(rows_split, as.integer(user_id)))
+
 cat("\n==== Diagnosis: the FIRST attempt that returns 200/success is the good ",
     "shape; the first that flips to 422 names the culprit. ====\n", sep = "")
